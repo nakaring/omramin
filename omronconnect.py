@@ -614,7 +614,61 @@ class OmronConnect1(OmronConnect):
         measurements: T.List[MeasurementTypes] = []
         devCat = DeviceCategory(returnedValue["deviceCategory"])
         deviceModelList = returnedValue["deviceModelList"]
+
+        # Current OMRON Connect API v1 may return no measurements from
+        # measureData even though measurement data exists.  The current
+        # Android client uses getIncrementalMeasureData for cloud sync.
         if deviceModelList is None:
+            incremental_data = {
+                "deviceCategory": [device.category.value],
+                "containDeleteFlag": 1,
+                "containCorrectedDataFlag": 1,
+                "searchDateFrom": searchDateFrom if searchDateFrom >= 0 else 0,
+                "searchDateTo": int(U.utcnow().timestamp() * 1000) if searchDateTo <= 0 else searchDateTo,
+            }
+
+            incremental_response = self._client.post(
+                f"{self._server}{self._APP_URL}/versions/current/getIncrementalMeasureData",
+                json=incremental_data,
+                headers=self._headers,
+            )
+            incremental_response.raise_for_status()
+
+            incremental_resp = incremental_response.json()
+            L.debug(incremental_resp)
+
+            incremental_value = incremental_resp.get("returnedValue")
+            if not isinstance(incremental_value, dict):
+                return measurements
+
+            if "errorCode" in incremental_value:
+                L.error(f"getIncrementalMeasureData -> {incremental_value}")
+                return measurements
+
+            deviceModelList = incremental_value.get("deviceModelList")
+            if not deviceModelList:
+                return measurements
+
+            # Incremental API serial IDs differ from BLE-derived serial IDs on
+            # some JP devices, so match model and user instead of serial.
+            expected_model = device.name.rsplit(":", 1)[0]
+
+            for devModel in deviceModelList:
+                if devModel.get("deviceModel") != expected_model:
+                    continue
+
+                for dev in devModel.get("deviceSerialIDList", []):
+                    try:
+                        if int(dev.get("userNumberInDevice", -1)) != int(device.user):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
+                    if device.category == DeviceCategory.BPM:
+                        measurements.extend(self._process_bpm_measurements(dev))
+                    elif device.category == DeviceCategory.SCALE:
+                        measurements.extend(self._process_scale_measurements(dev))
+
             return measurements
 
         for devModel in deviceModelList:
